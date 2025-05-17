@@ -11,6 +11,7 @@ parser.add_argument('--device', type=int, default=0, help='Camera device index (
 parser.add_argument('--midi-port', type=str, help='MIDI port name (overrides config in script)')
 parser.add_argument('--debug', action='store_true', help='Enable debug mode with additional visual feedback')
 parser.add_argument('--list-ports', action='store_true', help='List available MIDI ports and exit')
+parser.add_argument('--threshold', type=int, default=3, help='Threshold for MIDI CC value changes (default: 3)')
 args = parser.parse_args()
 
 # List MIDI ports if requested
@@ -19,8 +20,8 @@ if args.list_ports:
     exit(0)
 
 # MIDI Configuration
-MIDI_PORT_NAME = 'loopMIDI Port 1'  # Updated by midi_setup.py
-# MIDI_PORT_NAME = 'loopMIDI Port'   # For Windows (uncomment if using Windows)
+# MIDI_PORT_NAME = 'IAC Driver Bus 1'  # For Mac
+MIDI_PORT_NAME = 'loopMIDI Port'   # For Windows
 
 # Override MIDI port if specified in command line
 if args.midi_port:
@@ -79,18 +80,36 @@ hand_detected = False
 prev_hand_y = 0
 prev_mouth_open = 0
 last_gesture_time = time.time()
-cooldown = 0.05  # seconds between gesture processing
+cooldown = 0.1  # Increased from 0.05 to 0.1 seconds to reduce MIDI traffic
 active_preset = None
 note_being_played = None
 
 # For gesture detection history/smoothing
 gesture_history = {
-    "pitch": [64] * 5,
-    "formant": [64] * 5,
-    "vibrato": [0] * 5,
-    "distortion": [0] * 5,
-    "reverb": [30] * 5
+    "pitch": [64] * 10,     # Increased history length from 5 to 10
+    "formant": [64] * 10,
+    "vibrato": [0] * 10,
+    "distortion": [0] * 10,
+    "reverb": [30] * 10
 }
+
+# For tracking previous CC values to filter duplicates
+previous_cc_values = {
+    CC_PITCH: 64,
+    CC_FORMANT: 64,
+    CC_VIBRATO: 0,
+    CC_DISTORTION: 0,
+    CC_REVERB: 30,
+    CC_DELAY: 0,
+    CC_HARMONIZER: 0
+}
+
+def filter_cc_values(control, value, previous_value, threshold=3):
+    """Only send CC if value has changed significantly"""
+    if abs(value - previous_value) >= threshold:
+        midi_out.send(mido.Message('control_change', control=control, value=value))
+        return value
+    return previous_value
 
 def apply_smoothing(param_name, new_value, smoothing_factor=0.7):
     """Apply smoothing to parameter values to prevent jitter"""
@@ -231,19 +250,23 @@ def detect_eyebrow_raise(face_landmarks):
 
 def send_preset_parameters(preset_name):
     """Send MIDI messages for a predefined preset"""
+    global previous_cc_values  # Use global variable for filtering
     preset = GESTURE_PRESETS[preset_name]
+    threshold = args.threshold  # Use command-line threshold
     
-    # Send all CC messages for the preset
-    midi_out.send(mido.Message('control_change', control=CC_PITCH, value=preset["pitch"]))
-    midi_out.send(mido.Message('control_change', control=CC_FORMANT, value=preset["formant"]))
-    midi_out.send(mido.Message('control_change', control=CC_VIBRATO, value=preset["vibrato"]))
-    midi_out.send(mido.Message('control_change', control=CC_DISTORTION, value=preset["distortion"]))
-    midi_out.send(mido.Message('control_change', control=CC_REVERB, value=preset["reverb"]))
+    # Send all CC messages for the preset, with filtering to avoid glitches
+    previous_cc_values[CC_PITCH] = filter_cc_values(CC_PITCH, preset["pitch"], previous_cc_values[CC_PITCH], threshold)
+    previous_cc_values[CC_FORMANT] = filter_cc_values(CC_FORMANT, preset["formant"], previous_cc_values[CC_FORMANT], threshold)
+    previous_cc_values[CC_VIBRATO] = filter_cc_values(CC_VIBRATO, preset["vibrato"], previous_cc_values[CC_VIBRATO], threshold)
+    previous_cc_values[CC_DISTORTION] = filter_cc_values(CC_DISTORTION, preset["distortion"], previous_cc_values[CC_DISTORTION], threshold)
+    previous_cc_values[CC_REVERB] = filter_cc_values(CC_REVERB, preset["reverb"], previous_cc_values[CC_REVERB], threshold)
     
     # Return the preset values for display
     return preset
 
 print("Starting MidiCam Python - Press ESC to exit")
+print(f"CC Filtering threshold: {args.threshold}")
+print(f"MIDI update rate: {1/cooldown:.1f} messages per second")
 
 # Frame rate calculation
 prev_frame_time = 0
@@ -351,13 +374,14 @@ while cap.isOpened():
                         mp_drawing.DrawingSpec(color=(80, 256, 121), thickness=1, circle_radius=1)
                     )
         
-        # Send MIDI CC messages
-        midi_out.send(mido.Message('control_change', control=CC_PITCH, value=pitch_val))
-        midi_out.send(mido.Message('control_change', control=CC_FORMANT, value=formant_val))
-        midi_out.send(mido.Message('control_change', control=CC_VIBRATO, value=vibrato_val))
-        midi_out.send(mido.Message('control_change', control=CC_DISTORTION, value=distortion_val))
-        midi_out.send(mido.Message('control_change', control=CC_REVERB, value=reverb_val))
-        midi_out.send(mido.Message('control_change', control=CC_HARMONIZER, value=eyebrow_raise_val))
+        # Send MIDI CC messages with filtering to avoid glitches
+        threshold = args.threshold
+        previous_cc_values[CC_PITCH] = filter_cc_values(CC_PITCH, pitch_val, previous_cc_values[CC_PITCH], threshold)
+        previous_cc_values[CC_FORMANT] = filter_cc_values(CC_FORMANT, formant_val, previous_cc_values[CC_FORMANT], threshold)
+        previous_cc_values[CC_VIBRATO] = filter_cc_values(CC_VIBRATO, vibrato_val, previous_cc_values[CC_VIBRATO], threshold)
+        previous_cc_values[CC_DISTORTION] = filter_cc_values(CC_DISTORTION, distortion_val, previous_cc_values[CC_DISTORTION], threshold)
+        previous_cc_values[CC_REVERB] = filter_cc_values(CC_REVERB, reverb_val, previous_cc_values[CC_REVERB], threshold)
+        previous_cc_values[CC_HARMONIZER] = filter_cc_values(CC_HARMONIZER, eyebrow_raise_val, previous_cc_values[CC_HARMONIZER], threshold)
         
         last_gesture_time = current_time
     
